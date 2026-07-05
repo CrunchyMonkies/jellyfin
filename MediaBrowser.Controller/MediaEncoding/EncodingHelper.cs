@@ -20,6 +20,7 @@ using Jellyfin.Extensions;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Extensions;
 using MediaBrowser.Controller.IO;
+using MediaBrowser.Controller.Streaming;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Dto;
@@ -27,6 +28,7 @@ using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using MediaBrowser.Model.Session;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using IConfigurationManager = MediaBrowser.Common.Configuration.IConfigurationManager;
 
 namespace MediaBrowser.Controller.MediaEncoding
@@ -64,6 +66,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         private readonly IConfiguration _config;
         private readonly IConfigurationManager _configurationManager;
         private readonly IPathManager _pathManager;
+        private readonly ILogger<EncodingHelper> _logger;
 
         // i915 hang was fixed by linux 6.2 (3f882f2)
         private readonly Version _minKerneli915Hang = new Version(5, 18);
@@ -88,6 +91,9 @@ namespace MediaBrowser.Controller.MediaEncoding
         private readonly Version _minFFmpegRkmppHevcDecDoviRpu = new Version(7, 1, 1);
         private readonly Version _minFFmpegReadrateCatchupOption = new Version(8, 0);
         private readonly Version _minFFmpegNoiseBsfDrop = new Version(5, 0);
+        private readonly Version _minFFmpegFlacInMp4 = new Version(6, 0);
+        private readonly Version _minFFmpegX265BframeInFmp4 = new Version(7, 0, 1);
+        private readonly Version _minFFmpegHlsSegmentOptions = new Version(5, 0);
 
         private static readonly string[] _videoProfilesH264 =
         [
@@ -164,7 +170,8 @@ namespace MediaBrowser.Controller.MediaEncoding
             ISubtitleEncoder subtitleEncoder,
             IConfiguration config,
             IConfigurationManager configurationManager,
-            IPathManager pathManager)
+            IPathManager pathManager,
+            ILogger<EncodingHelper> logger = null)
         {
             _appPaths = appPaths;
             _mediaEncoder = mediaEncoder;
@@ -172,6 +179,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             _config = config;
             _configurationManager = configurationManager;
             _pathManager = pathManager;
+            _logger = logger;
         }
 
         private enum DynamicHdrMetadataRemovalPlan
@@ -7982,6 +7990,327 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             // -vsync is deprecated in FFmpeg 5.1 and will be removed in the future.
             return $" -vsync {videoSync}";
+        }
+
+        private static string NormalizePath(string path)
+        {
+            // Quotes are valid path characters in linux and they need to be escaped here with a leading \
+            return path.Replace("\"", "\\\"", StringComparison.Ordinal);
+        }
+
+        public string GetHlsVideoCommandLine(StreamState state, EncodingOptions encodingOptions, string outputPath, int startNumber, bool isEventPlaylist)
+        {
+            var videoCodec = GetVideoEncoder(state, encodingOptions);
+            var threads = GetNumberOfThreads(state, encodingOptions, videoCodec);
+
+            var mapArgs = state.IsOutputVideo ? GetMapArgs(state) : string.Empty;
+
+            var directory = Path.GetDirectoryName(outputPath) ?? throw new ArgumentException($"Provided path ({outputPath}) is not valid.", nameof(outputPath));
+            var outputFileNameWithoutExtension = Path.GetFileNameWithoutExtension(outputPath);
+            var outputPrefix = Path.Combine(directory, outputFileNameWithoutExtension);
+            var outputExtension = GetSegmentFileExtension(state.Request.SegmentContainer);
+            var outputTsArg = outputPrefix + "%d" + outputExtension;
+
+            var segmentFormat = string.Empty;
+            var segmentContainer = outputExtension.TrimStart('.');
+            var inputModifier = GetInputModifier(state, encodingOptions, segmentContainer);
+            var hlsArguments = $"-hls_playlist_type {(isEventPlaylist ? "event" : "vod")} -hls_list_size 0";
+
+            if (string.Equals(segmentContainer, "ts", StringComparison.OrdinalIgnoreCase))
+            {
+                segmentFormat = "mpegts";
+            }
+            else if (string.Equals(segmentContainer, "mp4", StringComparison.OrdinalIgnoreCase))
+            {
+                var outputFmp4HeaderArg = OperatingSystem.IsWindows() switch
+                {
+                    // on Windows, the path of fmp4 header file needs to be configured
+                    true => " -hls_fmp4_init_filename \"" + outputPrefix + "-1" + outputExtension + "\"",
+                    // on Linux/Unix, ffmpeg generate fmp4 header file to m3u8 output folder
+                    false => " -hls_fmp4_init_filename \"" + outputFileNameWithoutExtension + "-1" + outputExtension + "\""
+                };
+
+                var useLegacySegmentOption = _mediaEncoder.EncoderVersion < _minFFmpegHlsSegmentOptions;
+
+                if (state.VideoStream is not null && state.IsOutputVideo)
+                {
+                    // fMP4 needs this flag to write the audio packet DTS/PTS including the initial delay into MOOF::TRAF::TFDT
+                    hlsArguments += $" {(useLegacySegmentOption ? "-hls_ts_options" : "-hls_segment_options")} movflags=+frag_discont";
+                }
+
+                segmentFormat = "fmp4" + outputFmp4HeaderArg;
+            }
+            else
+            {
+                _logger?.LogError("Invalid HLS segment container: {SegmentContainer}, default to mpegts", segmentContainer);
+                segmentFormat = "mpegts";
+            }
+
+            var maxMuxingQueueSize = encodingOptions.MaxMuxingQueueSize > 128
+                ? encodingOptions.MaxMuxingQueueSize.ToString(CultureInfo.InvariantCulture)
+                : "128";
+
+            var baseUrlParam = string.Empty;
+            if (isEventPlaylist)
+            {
+                baseUrlParam = string.Format(
+                    CultureInfo.InvariantCulture,
+                    " -hls_base_url \"hls/{0}/\"",
+                    Path.GetFileNameWithoutExtension(outputPath));
+            }
+
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "{0} {1} -map_metadata -1 -map_chapters -1 -threads {2} {3} {4} {5} -copyts -avoid_negative_ts disabled -max_muxing_queue_size {6} -f hls -max_delay 5000000 -hls_time {7} -hls_segment_type {8} -start_number {9}{10} -hls_segment_filename \"{11}\" {12} -y \"{13}\"",
+                inputModifier,
+                GetInputArgument(state, encodingOptions, segmentContainer),
+                threads,
+                mapArgs,
+                GetHlsVideoArguments(state, encodingOptions, startNumber, isEventPlaylist, segmentContainer),
+                GetHlsAudioArguments(state, encodingOptions),
+                maxMuxingQueueSize,
+                state.SegmentLength.ToString(CultureInfo.InvariantCulture),
+                segmentFormat,
+                startNumber.ToString(CultureInfo.InvariantCulture),
+                baseUrlParam,
+                NormalizePath(outputTsArg),
+                hlsArguments,
+                NormalizePath(outputPath)).Trim();
+        }
+
+        public string GetHlsAudioArguments(StreamState state, EncodingOptions encodingOptions)
+        {
+            if (state.AudioStream is null)
+            {
+                return string.Empty;
+            }
+
+            var audioCodec = GetAudioEncoder(state);
+            var bitStreamArgs = GetAudioBitStreamArguments(state, state.Request.SegmentContainer, state.MediaSource.Container);
+
+            // opus, dts, truehd and flac (in FFmpeg 5 and older) are experimental in mp4 muxer
+            var strictArgs = string.Empty;
+            var actualOutputAudioCodec = state.ActualOutputAudioCodec;
+            if (string.Equals(actualOutputAudioCodec, "opus", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(actualOutputAudioCodec, "dts", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(actualOutputAudioCodec, "truehd", StringComparison.OrdinalIgnoreCase)
+                || (string.Equals(actualOutputAudioCodec, "flac", StringComparison.OrdinalIgnoreCase)
+                    && _mediaEncoder.EncoderVersion < _minFFmpegFlacInMp4))
+            {
+                strictArgs = " -strict -2";
+            }
+
+            if (!state.IsOutputVideo)
+            {
+                var audioTranscodeParams = string.Empty;
+
+                // -vn to drop any video streams
+                audioTranscodeParams += "-vn";
+
+                if (IsCopyCodec(audioCodec))
+                {
+                    return audioTranscodeParams + " -acodec copy" + bitStreamArgs + strictArgs;
+                }
+
+                audioTranscodeParams += " -acodec " + audioCodec + bitStreamArgs + strictArgs;
+
+                var audioBitrate = state.OutputAudioBitrate;
+                var audioChannels = state.OutputAudioChannels;
+
+                if (audioBitrate.HasValue && !LosslessAudioCodecs.Contains(state.ActualOutputAudioCodec, StringComparison.OrdinalIgnoreCase))
+                {
+                    var vbrParam = GetAudioVbrModeParam(audioCodec, audioBitrate.Value, audioChannels ?? 2);
+                    if (encodingOptions.EnableAudioVbr && state.EnableAudioVbrEncoding && vbrParam is not null)
+                    {
+                        audioTranscodeParams += vbrParam;
+                    }
+                    else
+                    {
+                        audioTranscodeParams += " -ab " + audioBitrate.Value.ToString(CultureInfo.InvariantCulture);
+                    }
+                }
+
+                if (audioChannels.HasValue)
+                {
+                    audioTranscodeParams += " -ac " + audioChannels.Value.ToString(CultureInfo.InvariantCulture);
+                }
+
+                if (state.OutputAudioSampleRate.HasValue)
+                {
+                    audioTranscodeParams += " -ar " + state.OutputAudioSampleRate.Value.ToString(CultureInfo.InvariantCulture);
+                }
+
+                return audioTranscodeParams;
+            }
+
+            if (IsCopyCodec(audioCodec))
+            {
+                var videoCodec = GetVideoEncoder(state, encodingOptions);
+                var copyArgs = "-codec:a:0 copy" + bitStreamArgs + strictArgs;
+
+                return copyArgs;
+            }
+
+            var args = "-codec:a:0 " + audioCodec + bitStreamArgs + strictArgs;
+
+            var channels = state.OutputAudioChannels;
+
+            var useDownMixAlgorithm = DownMixAlgorithmsHelper.AlgorithmFilterStrings.ContainsKey((encodingOptions.DownMixStereoAlgorithm, DownMixAlgorithmsHelper.InferChannelLayout(state.AudioStream)));
+
+            if (channels.HasValue
+                && (channels.Value != 2
+                    || (state.AudioStream?.Channels is not null && !useDownMixAlgorithm)))
+            {
+                args += " -ac " + channels.Value;
+            }
+
+            var bitrate = state.OutputAudioBitrate;
+            if (bitrate.HasValue && !LosslessAudioCodecs.Contains(actualOutputAudioCodec, StringComparison.OrdinalIgnoreCase))
+            {
+                var vbrParam = GetAudioVbrModeParam(audioCodec, bitrate.Value, channels ?? 2);
+                if (encodingOptions.EnableAudioVbr && state.EnableAudioVbrEncoding && vbrParam is not null)
+                {
+                    args += vbrParam;
+                }
+                else
+                {
+                    args += " -ab " + bitrate.Value.ToString(CultureInfo.InvariantCulture);
+                }
+            }
+
+            if (state.OutputAudioSampleRate.HasValue)
+            {
+                args += " -ar " + state.OutputAudioSampleRate.Value.ToString(CultureInfo.InvariantCulture);
+            }
+            else if (state.AudioStream?.CodecTag is not null && state.AudioStream.CodecTag.Equals("ac-4", StringComparison.Ordinal))
+            {
+                // ac-4 audio tends to have a super weird sample rate that will fail most encoders
+                // force resample it to 48KHz
+                args += " -ar 48000";
+            }
+
+            args += GetAudioFilterParam(state, encodingOptions);
+
+            return args;
+        }
+
+        public string GetHlsVideoArguments(StreamState state, EncodingOptions encodingOptions, int startNumber, bool isEventPlaylist, string segmentContainer)
+        {
+            if (state.VideoStream is null)
+            {
+                return string.Empty;
+            }
+
+            if (!state.IsOutputVideo)
+            {
+                return string.Empty;
+            }
+
+            var codec = GetVideoEncoder(state, encodingOptions);
+
+            var args = "-codec:v:0 " + codec;
+
+            var isActualOutputVideoCodecAv1 = string.Equals(state.ActualOutputVideoCodec, "av1", StringComparison.OrdinalIgnoreCase);
+            var isActualOutputVideoCodecHevc = string.Equals(state.ActualOutputVideoCodec, "h265", StringComparison.OrdinalIgnoreCase)
+                                               || string.Equals(state.ActualOutputVideoCodec, "hevc", StringComparison.OrdinalIgnoreCase);
+
+            if (isActualOutputVideoCodecHevc || isActualOutputVideoCodecAv1)
+            {
+                var requestedRange = state.GetRequestedRangeTypes(state.ActualOutputVideoCodec);
+                // Clients reporting Dolby Vision capabilities with fallbacks may only support the fallback layer.
+                // Only enable Dolby Vision remuxing if the client explicitly declares support for profiles without fallbacks.
+                var clientSupportsDoVi = requestedRange.Contains(VideoRangeType.DOVI.ToString(), StringComparison.OrdinalIgnoreCase);
+                var videoIsDoVi = IsDovi(state.VideoStream);
+
+                if (IsCopyCodec(codec)
+                    && (videoIsDoVi && clientSupportsDoVi)
+                    && !IsDoviRemoved(state))
+                {
+                    if (isActualOutputVideoCodecHevc)
+                    {
+                        // Use hvc1 for 8.4. This is what Dolby uses for its official sample streams. Tagging with dvh1 would break some players with strict tag checking like Apple Safari.
+                        var codecTag = state.VideoStream.VideoRangeType == VideoRangeType.DOVIWithHLG ? "hvc1" : "dvh1";
+                        args += $" -tag:v:0 {codecTag} -strict -2";
+                    }
+                    else if (isActualOutputVideoCodecAv1)
+                    {
+                        args += " -tag:v:0 dav1 -strict -2";
+                    }
+                }
+                else if (isActualOutputVideoCodecHevc)
+                {
+                    // Prefer hvc1 to hev1
+                    args += " -tag:v:0 hvc1";
+                }
+            }
+
+            // if  (state.EnableMpegtsM2TsMode)
+            // {
+            //     args += " -mpegts_m2ts_mode 1";
+            // }
+
+            // See if we can save come cpu cycles by avoiding encoding.
+            if (IsCopyCodec(codec))
+            {
+                // If h264_mp4toannexb is ever added, do not use it for live tv.
+                if (state.VideoStream is not null && !string.Equals(state.VideoStream.NalLengthSize, "0", StringComparison.OrdinalIgnoreCase))
+                {
+                    string bitStreamArgs = GetBitStreamArgs(state, MediaStreamType.Video);
+                    if (!string.IsNullOrEmpty(bitStreamArgs))
+                    {
+                        args += " " + bitStreamArgs;
+                    }
+                }
+
+                args += " -start_at_zero";
+            }
+            else
+            {
+                args += GetVideoQualityParam(state, codec, encodingOptions, isEventPlaylist ? EncoderPreset.superfast : EncoderPreset.veryfast);
+
+                // Set the key frame params for video encoding to match the hls segment time.
+                args += GetHlsVideoKeyFrameArguments(state, codec, state.SegmentLength, isEventPlaylist, startNumber);
+
+                // Currently b-frames in libx265 breaks the FMP4-HLS playback on iOS, disable it for now.
+                if (string.Equals(codec, "libx265", StringComparison.OrdinalIgnoreCase)
+                    && _mediaEncoder.EncoderVersion < _minFFmpegX265BframeInFmp4)
+                {
+                    args += " -bf 0";
+                }
+
+                // video processing filters.
+                var videoProcessParam = GetVideoProcessingFilterParam(state, encodingOptions, codec);
+
+                var negativeMapArgs = GetNegativeMapArgsByFilters(state, videoProcessParam);
+
+                args = negativeMapArgs + args + videoProcessParam;
+
+                // -start_at_zero is necessary to use with -ss when seeking,
+                // otherwise the target position cannot be determined.
+                if (state.SubtitleStream is not null)
+                {
+                    // Disable start_at_zero for external graphical subs
+                    if (!(state.SubtitleStream.IsExternal && !state.SubtitleStream.IsTextSubtitleStream))
+                    {
+                        args += " -start_at_zero";
+                    }
+                }
+            }
+
+            // TODO why was this not enabled for VOD?
+            if (isEventPlaylist && string.Equals(segmentContainer, "ts", StringComparison.OrdinalIgnoreCase))
+            {
+                args += " -flags -global_header";
+            }
+
+            if (!string.IsNullOrEmpty(state.OutputVideoSync))
+            {
+                args += GetVideoSyncOption(state.OutputVideoSync, _mediaEncoder.EncoderVersion);
+            }
+
+            args += GetOutputFFlags(state);
+
+            return args;
         }
     }
 }
