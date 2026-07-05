@@ -1,4 +1,9 @@
 .git
+.github
+.omc
+.serena
+**/bin
+**/obj
 .dockerignore
 Dockerfile
 Dockerfile.arm
