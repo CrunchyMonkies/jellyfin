@@ -13,8 +13,10 @@
 
 ARG DOTNET_VERSION=10.0
 # Runtime base: reused only for jellyfin-ffmpeg + GPU drivers + fonts. Pin to a stable
-# release; overridable at build time.
-ARG JELLYFIN_BASE=jellyfin/jellyfin:10.10.7
+# release; overridable at build time. The pin dictates the ffmpeg/VA-API stack, so it must
+# be new enough for the GPUs this image transcodes on — 10.10.7 carried jellyfin-ffmpeg
+# 7.0.2-9 (iHD 24.x), which cannot vaInitialize on Arc B-series (Battlemage, xe KMD).
+ARG JELLYFIN_BASE=jellyfin/jellyfin:10.11.11
 
 FROM mcr.microsoft.com/dotnet/sdk:${DOTNET_VERSION} AS builder
 WORKDIR /src
