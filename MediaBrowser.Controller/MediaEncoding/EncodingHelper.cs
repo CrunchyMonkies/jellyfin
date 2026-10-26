@@ -171,8 +171,21 @@ namespace MediaBrowser.Controller.MediaEncoding
             ISubtitleEncoder subtitleEncoder,
             IConfiguration config,
             IConfigurationManager configurationManager,
+            IPathManager pathManager)
+            : this(appPaths, mediaEncoder, subtitleEncoder, config, configurationManager, pathManager, null)
+        {
+        }
+
+        // A separate overload rather than an optional parameter, so the upstream constructor above
+        // stays binary compatible. DI picks this one, as it has the most resolvable parameters.
+        public EncodingHelper(
+            IApplicationPaths appPaths,
+            IMediaEncoder mediaEncoder,
+            ISubtitleEncoder subtitleEncoder,
+            IConfiguration config,
+            IConfigurationManager configurationManager,
             IPathManager pathManager,
-            ILogger<EncodingHelper> logger = null)
+            ILogger<EncodingHelper> logger)
         {
             _appPaths = appPaths;
             _mediaEncoder = mediaEncoder;
